@@ -496,6 +496,7 @@ def execute_trade(signal, market, asset):
                     })
                     profit_est = (float(r.get("cfmPrice", sell_price)) - hold_cost) * float(r.get("cfmVol", vol))
                     print(f"   ✅ 成交! {r.get('cfmVol')}g @ {r.get('cfmPrice')} | 余额:{r.get('availableBalance')} | 实盈≈{profit_est:.0f}")
+                    save_state()  # 持久化
                 else:
                     print(f"   ❌ 失败: {ds.get('message', 'unknown')}")
             except Exception as e:
@@ -548,6 +549,7 @@ def execute_trade(signal, market, asset):
                         "balance": r.get("availableBalance"),
                     })
                     print(f"   ✅ 成交! {r.get('cfmVol')}g @ {r.get('cfmPrice')} | 余额:{r.get('availableBalance')}{rebuy_gain}")
+                    save_state()  # 持久化
                     # 重置卖出价
                     if action == "BUY_REBUY":
                         _last_sell_price = None
@@ -585,6 +587,9 @@ if __name__ == "__main__":
         print("💾 状态已保存")
 
     elif args.mode == "daemon":
+        load_state()  # 启动时加载持久化状态
+        if _last_sell_price:
+            print(f"📂 加载状态: 上次卖出价 {_last_sell_price}, 日志 {len(_trade_log)} 条")
         print("🤖 全自动交易守护进程启动")
         print(f"   扫描间隔: {args.interval}s | 冷却时间: {args.cooldown}s")
         print(f"   交易时间: 09:10 - 次日 02:00")
