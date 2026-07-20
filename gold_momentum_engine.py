@@ -186,10 +186,10 @@ def calc_support_resistance(prices):
 # ============================================================
 # 激进参数 — 每次波段目标净赚 100-300 元
 PROFIT_TARGET = 0.12      # 止盈阈值 0.12% ≈ +1.0元/克 ≈ +114元
-STOP_LOSS_PCT = -0.30     # 止损阈值 -0.30%
-REBUY_DISCOUNT = 0.30     # 回购折扣：比卖出价低 0.30% 才买回（覆盖价差+微利）
-BREAKOUT_CONFIRM = 0.15   # 突破确认幅度
-LONDON_LEAD = 0.20        # 伦敦金领先阈值 (%)
+STOP_LOSS_PCT = -0.30     # 基准止损阈值
+STOP_LOSS_LOWVOL = -0.50  # 低波动放宽止损（防毛刺触发）
+REBUY_DISCOUNT = 0.25     # 回购折扣（略放宽）
+CHASE_THRESHOLD = 0.25    # 追回阈值：止损后趋势反转即追回（5m动量）
 
 # 全局状态（跨循环记忆 + 文件持久化）
 _last_sell_price = None   # 上次卖出价，用于计算回购时机
@@ -323,15 +323,17 @@ def generate_signal(market, london, history, asset):
             signal["action"] = "SELL_PEAK"
             signal["reason"] = f"高位衰竭 {sr['position']:.0f}% 5m动量{m5:+.1f}"
         
-        # ⚡ 动量急转：15分钟连续下跌 + 跌破均价
-        elif m15 < -1.0 and sr and buy_price < sr["avg"]:
+        # ⚡ 动量急转：15分钟连续下跌 + 跌破均价（高波动时才触发）
+        elif m15 < -1.5 and sr and buy_price < sr["avg"] and volatility > 0.6:
             signal["action"] = "STOP_LOSS"
-            signal["reason"] = f"动量急转 15m{m15:+.1f} 跌破均线{sr['avg']}"
+            signal["reason"] = f"动量急转 15m{m15:+.1f} 跌破均线 波动{volatility:.1f}"
         
-        # 🛑 硬止损：亏损 ≥ 0.30%
-        elif profit_pct <= STOP_LOSS_PCT:
-            signal["action"] = "STOP_LOSS"
-            signal["reason"] = f"硬止损 {profit_pct:.2f}% 保护本金"
+        # 🛑 硬止损：波动率自适应阈值（低波放宽防毛刺，高波收紧）
+        elif profit_pct <= (STOP_LOSS_LOWVOL if volatility < 0.5 else STOP_LOSS_PCT):
+            # 低波动时必须也有动量确认才止损，防止窄幅毛刺触发
+            if volatility >= 0.5 or m5 < -0.15:
+                signal["action"] = "STOP_LOSS"
+                signal["reason"] = f"硬止损 {profit_pct:.2f}% 波动{volatility:.1f} {'低波放宽' if volatility<0.5 else '标准'}"
         
         # 🚀 突破回踩：短暂突破前高后回落（假突破出货）
         elif sr and float(sr["high"]) > 0 and buy_price < float(sr["high"]) - 1.0 and m5 < -0.3 and profit_pct > 0:
@@ -342,12 +344,20 @@ def generate_signal(market, london, history, asset):
     # 🔥 追击模式 — 买入信号
     # ============================================
     if available > 1500:
-        # 🎯 回购：相对上次卖出价有足够折扣
+        # 🔄 止损后追回：空仓 + 上次是止损 + 趋势反转确认 → 追回仓位
         if _last_sell_price and hold_weight == 0:
-            discount_pct = (_last_sell_price - buy_price) / _last_sell_price * 100
-            if discount_pct >= REBUY_DISCOUNT and m3 > 0:
+            gain_pct = (_last_sell_price - buy_price) / _last_sell_price * 100
+            
+            # ① 折扣回购：价格比卖出价低 ≥ 0.25%
+            if gain_pct >= REBUY_DISCOUNT and m3 > 0:
                 signal["action"] = "BUY_REBUY"
-                signal["reason"] = f"回购 卖{_last_sell_price:.1f}→买{buy_price:.1f} 折扣{discount_pct:.2f}%"
+                signal["reason"] = f"回购 卖{_last_sell_price:.1f}→买{buy_price:.1f} 折扣{gain_pct:.2f}%"
+            
+            # ② 追回信号：趋势反转（5m+15m都转正 + 价格在日内中位以上）
+            # 防止止损后踏空——宁可追高买回
+            elif m5 > CHASE_THRESHOLD and m15 > -0.2 and sr and sr["position"] > 35:
+                signal["action"] = "BUY_CHASE"
+                signal["reason"] = f"追回! 趋势反转 5m{m5:+.1f} 15m{m15:+.1f} 位置{sr['position']:.0f}%"
         
         # 📈 V型反转：15分钟急跌 + 3分钟急涨
         if m15 < -1.5 and m3 > 0.6:
@@ -359,14 +369,13 @@ def generate_signal(market, london, history, asset):
             signal["action"] = "BUY_DIP"
             signal["reason"] = f"支撑抄底 {sr['position']:.0f}% 动量{score:+.1f}"
         
-        # 🔥 伦敦金领先：伦敦金涨但积存金未跟（套利）
+        # 💱 伦敦金套利：伦敦金涨但积存金未跟
         if london_gram > 0 and implied_cn > 0:
-            london_pct = (london_gram / (london_gram + 0.01) - 1) * 100  # 近似
             if m3 > 0.3 and buy_price < implied_cn * 0.998:
                 signal["action"] = "BUY_ARB"
-                signal["reason"] = f"伦敦金套利 隐含价{implied_cn:.1f} 现价{buy_price:.1f}"
+                signal["reason"] = f"伦敦套利 隐含{implied_cn:.1f} 现价{buy_price:.1f}"
         
-        # 📊 突破追涨：突破日内高点 + 动量加速
+        # 🚀 突破追涨：突破日内高点 + 动量加速
         if sr and float(sr["high"]) > 0:
             breakout = (buy_price - float(sr["high"])) / float(sr["high"]) * 100
             if breakout > 0.05 and score > 0.4:
@@ -500,7 +509,7 @@ def execute_trade(signal, market, asset):
         
         max_amount = int(available)
         # 激进模式：全仓买入
-        if action in ("BUY_REBUY", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
+        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
             amount = max_amount
         else:
             amount = max_amount
@@ -510,6 +519,7 @@ def execute_trade(signal, market, asset):
         
         tag = {
             "BUY_REBUY": "🔄回购",
+            "BUY_CHASE": "🏃追回",
             "BUY_V": "📈V反",
             "BUY_DIP": "🌊抄底",
             "BUY_ARB": "💱套利",
