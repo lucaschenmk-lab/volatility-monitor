@@ -182,14 +182,98 @@ def calc_support_resistance(prices):
     }
 
 # ============================================================
-# 交易信号引擎 (追击模式 v2)
+# 交易信号引擎 (追击模式 v3 — 全激进)
 # ============================================================
-# 激进参数 — 每次波段目标净赚 100-300 元
-PROFIT_TARGET = 0.12      # 止盈阈值 0.12% ≈ +1.0元/克 ≈ +114元
-STOP_LOSS_PCT = -0.30     # 基准止损阈值
-STOP_LOSS_LOWVOL = -0.50  # 低波动放宽止损（防毛刺触发）
-REBUY_DISCOUNT = 0.25     # 回购折扣（略放宽）
-CHASE_THRESHOLD = 0.25    # 追回阈值：止损后趋势反转即追回（5m动量）
+
+# ---- 时段感知参数 ----
+# 死水期 11:30-14:30 | 欧盘 15:00-17:30 | 美盘 20:00-23:00 | 其余为过渡期
+def get_session_params():
+    """根据北京时间返回当前时段的激进参数"""
+    h = datetime.now().hour
+    m = datetime.now().minute
+    t = h + m / 60.0
+    
+    if 11.5 <= t < 14.5:
+        # 🕐 死水期：波动小，收紧止盈，放宽止损防毛刺
+        return {
+            "name": "死水期",
+            "profit_target": 0.30,     # 0.30% ≈ 2.6元/克，覆盖价差后微利
+            "stop_loss": -0.55,         # 宽止损防毛刺
+            "stop_loss_lowvol": -0.70,
+            "rebuy_discount": 0.20,
+            "chase_threshold": 0.20,
+            "momentum_stop": -1.2,      # 动量急转阈值（较低，死水期少见）
+        }
+    elif 15.0 <= t < 17.5:
+        # 🇪🇺 欧盘：波动放大，正常止盈+紧止损
+        return {
+            "name": "欧盘",
+            "profit_target": 0.45,     # 覆盖价差(0.43%)+利润
+            "stop_loss": -0.35,
+            "stop_loss_lowvol": -0.50,
+            "rebuy_discount": 0.30,
+            "chase_threshold": 0.30,
+            "momentum_stop": -1.8,
+        }
+    elif 20.0 <= t < 23.0:
+        # 🇺🇸 美盘：最大波动，激进止盈+适度止损
+        return {
+            "name": "美盘",
+            "profit_target": 0.55,     # 大波段目标
+            "stop_loss": -0.30,
+            "stop_loss_lowvol": -0.40,
+            "rebuy_discount": 0.35,
+            "chase_threshold": 0.35,
+            "momentum_stop": -2.0,
+        }
+    else:
+        # 🌅 过渡期：均衡参数
+        return {
+            "name": "过渡期",
+            "profit_target": 0.40,
+            "stop_loss": -0.40,
+            "stop_loss_lowvol": -0.55,
+            "rebuy_discount": 0.25,
+            "chase_threshold": 0.25,
+            "momentum_stop": -1.5,
+        }
+
+# ---- 背离检测 ----
+def detect_divergence(prices):
+    """
+    检测价格与动量的背离
+    返回: 'bearish' (价创新高但动量衰减) | 'bullish' (价创新低但动量回升) | None
+    """
+    if len(prices) < 15:
+        return None
+    
+    closes = [p[1] for p in prices]
+    highs = [p[3] for p in prices if len(p) > 3]
+    lows = [p[4] for p in prices if len(p) > 4]
+    
+    if not highs or not lows:
+        return None
+    
+    # 最近5分钟 vs 前10分钟
+    recent = closes[-5:]
+    earlier = closes[-15:-5]
+    
+    recent_high = max(highs[-5:]) if len(highs) >= 5 else max(recent)
+    earlier_high = max(highs[-15:-5]) if len(highs) >= 15 else max(earlier)
+    recent_low = min(lows[-5:]) if len(lows) >= 5 else min(recent)
+    earlier_low = min(lows[-15:-5]) if len(lows) >= 15 else min(earlier)
+    
+    recent_momentum = sum(recent) / len(recent) - sum(earlier) / len(earlier)
+    
+    # 顶背离：价格创新高但动量衰减
+    if recent_high > earlier_high and recent_momentum < -0.2:
+        return "bearish"
+    
+    # 底背离：价格创新低但动量回升
+    if recent_low < earlier_low and recent_momentum > 0.2:
+        return "bullish"
+    
+    return None
 
 # 全局状态（跨循环记忆 + 文件持久化）
 _last_sell_price = None   # 上次卖出价，用于计算回购时机
@@ -308,79 +392,96 @@ def generate_signal(market, london, history, asset):
     
     profit_pct = (buy_price - hold_cost) / hold_cost * 100 if hold_cost > 0 else 0
     signal["profit_pct"] = round(profit_pct, 3)
+
+    # 时段参数
+    sess = get_session_params()
+    signal["session"] = sess["name"]
+    
+    # 背离检测
+    divergence = detect_divergence(prices)
+    if divergence:
+        signal["divergence"] = divergence
     
     # ============================================
-    # 🔥 追击模式 — 卖出信号
+    # 🔥 v3 卖出信号
     # ============================================
     if hold_weight > 0:
-        # 🎯 微利止盈：盈利 ≥ 0.12% + 3分钟动量转负
-        if profit_pct >= PROFIT_TARGET and m3 < -0.1:
-            signal["action"] = "SELL_PROFIT"
-            signal["reason"] = f"微利止盈 +{profit_pct:.2f}% 3m动量{m3:+.1f}"
+        # 🚨 顶背离：价格创新高但动量衰减 → 最佳逃顶点
+        if divergence == "bearish" and profit_pct > 0.15:
+            signal["action"] = "SELL_DIVERGENCE"
+            signal["reason"] = f"顶背离! 价创新高+动量衰减 盈利{profit_pct:.2f}%"
         
-        # 🏔️ 高位衰竭：日内高位 80%+ 且 5分钟动量快速转负
-        elif sr and sr["position"] > 80 and m5 < -0.5:
+        # 🎯 止盈：时段自适应阈值 + 3分钟动量转负
+        elif profit_pct >= sess["profit_target"] and m3 < -0.1:
+            signal["action"] = "SELL_PROFIT"
+            signal["reason"] = f"止盈 +{profit_pct:.2f}% [{sess['name']}阈值{sess['profit_target']:.2f}%] 3m动量{m3:+.1f}"
+        
+        # 🏔️ 高位衰竭：日内高位 75%+ 且 5分钟动量急转
+        elif sr and sr["position"] > 75 and m5 < -0.6:
             signal["action"] = "SELL_PEAK"
             signal["reason"] = f"高位衰竭 {sr['position']:.0f}% 5m动量{m5:+.1f}"
         
-        # ⚡ 动量急转：15分钟连续下跌 + 跌破均价（高波动时才触发）
-        elif m15 < -1.5 and sr and buy_price < sr["avg"] and volatility > 0.6:
+        # ⚡ 动量急转：时段自适应阈值 + 跌破均价
+        elif m15 < sess["momentum_stop"] and sr and buy_price < sr["avg"] and volatility > 0.5:
             signal["action"] = "STOP_LOSS"
-            signal["reason"] = f"动量急转 15m{m15:+.1f} 跌破均线 波动{volatility:.1f}"
+            signal["reason"] = f"动量急转 15m{m15:+.1f} 跌破均线 [{sess['name']}]"
         
-        # 🛑 硬止损：波动率自适应阈值（低波放宽防毛刺，高波收紧）
-        elif profit_pct <= (STOP_LOSS_LOWVOL if volatility < 0.5 else STOP_LOSS_PCT):
-            # 低波动时必须也有动量确认才止损，防止窄幅毛刺触发
+        # 🛑 硬止损：波动率自适应
+        elif profit_pct <= (sess["stop_loss_lowvol"] if volatility < 0.5 else sess["stop_loss"]):
             if volatility >= 0.5 or m5 < -0.15:
                 signal["action"] = "STOP_LOSS"
-                signal["reason"] = f"硬止损 {profit_pct:.2f}% 波动{volatility:.1f} {'低波放宽' if volatility<0.5 else '标准'}"
+                signal["reason"] = f"止损 {profit_pct:.2f}% σ{volatility:.1f} [{sess['name']}]"
         
-        # 🚀 突破回踩：短暂突破前高后回落（假突破出货）
-        elif sr and float(sr["high"]) > 0 and buy_price < float(sr["high"]) - 1.0 and m5 < -0.3 and profit_pct > 0:
+        # 🚀 假突破回踩
+        elif sr and float(sr["high"]) > 0 and buy_price < float(sr["high"]) - 0.8 and m5 < -0.3 and profit_pct > 0:
             signal["action"] = "SELL_PEAK"
-            signal["reason"] = f"假突破回踩 高{sr['high']} 现{buy_price:.1f}"
+            signal["reason"] = f"假突破 高{sr['high']} 现{buy_price:.1f}"
     
     # ============================================
-    # 🔥 追击模式 — 买入信号
+    # 🔥 v3 买入信号
     # ============================================
     if available > 1500:
-        # 🔄 止损后追回：空仓 + 上次是止损 + 趋势反转确认 → 追回仓位
+        # 💡 底背离：价格创新低但动量回升 → 最佳抄底点
+        if divergence == "bullish" and hold_weight == 0:
+            signal["action"] = "BUY_DIVERGENCE"
+            signal["reason"] = f"底背离! 价创新低+动量回升"
+        
+        # 🔄 回购/追回逻辑（空仓时）
         if _last_sell_price and hold_weight == 0:
             gain_pct = (_last_sell_price - buy_price) / _last_sell_price * 100
             
-            # ① 折扣回购：价格比卖出价低 ≥ 0.25%
-            if gain_pct >= REBUY_DISCOUNT and m3 > 0:
+            # ① 折扣回购
+            if gain_pct >= sess["rebuy_discount"] and m3 > 0:
                 signal["action"] = "BUY_REBUY"
                 signal["reason"] = f"回购 卖{_last_sell_price:.1f}→买{buy_price:.1f} 折扣{gain_pct:.2f}%"
             
-            # ② 追回信号：趋势反转（5m+15m都转正 + 价格在日内中位以上）
-            # 防止止损后踏空——宁可追高买回
-            elif m5 > CHASE_THRESHOLD and m15 > -0.2 and sr and sr["position"] > 35:
+            # ② 追回：趋势反转确认
+            elif m5 > sess["chase_threshold"] and m15 > -0.2 and sr and sr["position"] > 30:
                 signal["action"] = "BUY_CHASE"
-                signal["reason"] = f"追回! 趋势反转 5m{m5:+.1f} 15m{m15:+.1f} 位置{sr['position']:.0f}%"
+                signal["reason"] = f"追回! 5m{m5:+.1f} 15m{m15:+.1f} [{sess['name']}]"
         
-        # 📈 V型反转：15分钟急跌 + 3分钟急涨
+        # 📈 V型反转
         if m15 < -1.5 and m3 > 0.6:
             signal["action"] = "BUY_V"
             signal["reason"] = f"V反! 15m{m15:+.1f}→3m{m3:+.1f}"
         
-        # 🌊 支撑抄底：价格在日内低位 15%- 且动量转正
+        # 🌊 支撑抄底
         if sr and sr["position"] < 15 and score > 0.15:
             signal["action"] = "BUY_DIP"
-            signal["reason"] = f"支撑抄底 {sr['position']:.0f}% 动量{score:+.1f}"
+            signal["reason"] = f"抄底 {sr['position']:.0f}% 动量{score:+.1f}"
         
-        # 💱 伦敦金套利：伦敦金涨但积存金未跟
+        # 💱 伦敦套利
         if london_gram > 0 and implied_cn > 0:
             if m3 > 0.3 and buy_price < implied_cn * 0.998:
                 signal["action"] = "BUY_ARB"
                 signal["reason"] = f"伦敦套利 隐含{implied_cn:.1f} 现价{buy_price:.1f}"
         
-        # 🚀 突破追涨：突破日内高点 + 动量加速
+        # 🚀 突破追涨
         if sr and float(sr["high"]) > 0:
             breakout = (buy_price - float(sr["high"])) / float(sr["high"]) * 100
-            if breakout > 0.05 and score > 0.4:
+            if breakout > 0.03 and score > 0.4:
                 signal["action"] = "BUY_BREAK"
-                signal["reason"] = f"突破追涨 +{breakout:.2f}% 动量{score:+.1f}"
+                signal["reason"] = f"突破 +{breakout:.2f}% 动量{score:+.1f}"
     
     # 金价接近强支撑 870
     if buy_price <= 872.5:
@@ -476,7 +577,7 @@ def execute_trade(signal, market, asset):
             return
         
         amount = round(vol * sell_price, 2)
-        tag = {"SELL_PROFIT": "💰止盈", "SELL_PEAK": "🏔️逃顶", "STOP_LOSS": "🛑止损"}.get(action, "🔻卖出")
+        tag = {"SELL_PROFIT": "💰止盈", "SELL_DIVERGENCE": "🚨背离", "SELL_PEAK": "🏔️逃顶", "STOP_LOSS": "🛑止损"}.get(action, "🔻卖出")
         print(f"   {tag} {vol}g × {sell_price} = {amount}元")
         
         resp = trade_sell(vol, amount, sell_price, sell_id)
@@ -510,7 +611,7 @@ def execute_trade(signal, market, asset):
         
         max_amount = int(available)
         # 激进模式：全仓买入
-        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
+        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_DIVERGENCE", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
             amount = max_amount
         else:
             amount = max_amount
@@ -521,6 +622,7 @@ def execute_trade(signal, market, asset):
         tag = {
             "BUY_REBUY": "🔄回购",
             "BUY_CHASE": "🏃追回",
+            "BUY_DIVERGENCE": "💡底背离",
             "BUY_V": "📈V反",
             "BUY_DIP": "🌊抄底",
             "BUY_ARB": "💱套利",
@@ -640,7 +742,9 @@ if __name__ == "__main__":
             pos_str = signal.get("position", "?") if signal else "?"
             vol_str = f" σ:{signal.get('volatility',0):.1f}" if signal else ""
             
-            print(f"[{now_str}] #{loop_count} {cooldown_mark} 买{buy:.1f}{lx_str} 动量{score:+.1f}{vol_str} {pos_str}{profit_str} → {action}")
+            sess = signal.get("session", "?") if signal else "?"
+            div = f" {signal.get('divergence','')}" if signal and signal.get("divergence") else ""
+            print(f"[{now_str}] #{loop_count} {cooldown_mark} 买{buy:.1f}{lx_str} 动量{score:+.1f}{vol_str} {pos_str}{profit_str} [{sess}]{div} → {action}")
 
             # 执行交易
             if action != "HOLD" and not in_cooldown and asset:

@@ -2,10 +2,8 @@ name: 🥇 Gold Momentum Trader
 
 on:
   schedule:
-    # 每 2 分钟触发（欧盘 15:00 - 美盘 02:00 北京时间）
-    - cron: '*/2 0-17 * * 1-5'   # UTC 0-17 = 北京时间 8:00-01:00
-    - cron: '*/2 18-23 * * 0-6'  # UTC 18-23 周末也覆盖
-  # 也允许手动触发
+    # 每分钟触发（北京时间 08:00-02:00 = UTC 00:00-18:00）
+    - cron: '* 0-17 * * *'
   workflow_dispatch:
 
 jobs:
@@ -16,8 +14,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,7 +25,7 @@ jobs:
           TTFUND_APIKEY: ${{ secrets.TTFUND_APIKEY }}
         run: python3 -u gold_momentum_engine.py cloud
 
-      - name: Commit state (if changed)
+      - name: Commit state
         if: always()
         run: |
           if [ -f gold_engine_state.json ]; then
