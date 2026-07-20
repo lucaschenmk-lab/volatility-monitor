@@ -1,9 +1,8 @@
 {
-  "last_sell_price": 871.50,
-  "last_sell_time": "13:15:20",
-  "trade_log": [
-    {"time": "12:56:03", "action": "BUY", "vol": "114.10", "price": "876.32", "balance": "11.88"},
-    {"time": "13:15:20", "action": "SELL", "vol": "114.10", "price": "871.50", "balance": "99450.03"}
-  ],
-  "updated": "2026-07-20 14:04:00"
+  "last_sell_price": 872.02,
+  "last_sell_time": "16:08:21",
+  "last_trade_time": 0,
+  "last_trade_dir": null,
+  "trade_log": [],
+  "updated": "2026-07-20 16:50:00"
 }

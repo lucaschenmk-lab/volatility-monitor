@@ -298,8 +298,12 @@ def detect_divergence(prices):
 # 全局状态（跨循环记忆 + 文件持久化）
 _last_sell_price = None   # 上次卖出价，用于计算回购时机
 _last_sell_time = None
+_last_trade_time = 0       # 上次交易时间戳（防频繁交易）
+_last_trade_dir = None     # 上次交易方向 'BUY'/'SELL'
 _trade_log = []            # 交易日志
 STATE_FILE = "gold_engine_state.json"  # 云端持久化文件
+SAME_DIR_COOLDOWN = 1800   # 同方向冷却 30 分钟
+CHASE_REQUIRE_DISCOUNT = True  # 追回必须低于卖出价
 
 def load_state():
     """从文件加载状态（GitHub Actions 跨运行持久化）"""
@@ -310,6 +314,8 @@ def load_state():
                 s = json.load(f)
             _last_sell_price = s.get("last_sell_price")
             _last_sell_time = s.get("last_sell_time")
+            _last_trade_time = s.get("last_trade_time", 0)
+            _last_trade_dir = s.get("last_trade_dir")
             _trade_log = s.get("trade_log", [])
             return True
     except:
@@ -323,7 +329,9 @@ def save_state():
             json.dump({
                 "last_sell_price": _last_sell_price,
                 "last_sell_time": _last_sell_time,
-                "trade_log": _trade_log[-20:],  # 只保留最近20条
+                "last_trade_time": _last_trade_time,
+                "last_trade_dir": _last_trade_dir,
+                "trade_log": _trade_log[-20:],
                 "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }, f, indent=2)
     except:
@@ -331,7 +339,7 @@ def save_state():
 
 def generate_signal(market, london, history, asset):
     """生成激进交易信号 — 追击模式"""
-    global _last_sell_price, _last_sell_time, _trade_log
+    global _last_sell_price, _last_sell_time, _trade_log, _last_trade_time, _last_trade_dir
     
     if not market or not history:
         return {"action": "HOLD", "reason": "数据不足"}
@@ -339,6 +347,13 @@ def generate_signal(market, london, history, asset):
     buy_price = float(market["buyPrice"])
     sell_price = float(market["sellPrice"])
     spread = buy_price - sell_price
+    
+    # ⛔ 同方向冷却检查：30分钟内不重复同向交易
+    same_dir_blocked = False
+    if _last_trade_time and _last_trade_dir:
+        elapsed = time.time() - _last_trade_time
+        if elapsed < SAME_DIR_COOLDOWN:
+            same_dir_blocked = True
     
     # 解析K线数据
     klines = history.get("list", [])
@@ -426,18 +441,20 @@ def generate_signal(market, london, history, asset):
     # 🔥 v3 卖出信号
     # ============================================
     if hold_weight > 0:
+        sell_blocked = same_dir_blocked and _last_trade_dir == "SELL"
+        
         # 🚨 顶背离：价格创新高但动量衰减 → 最佳逃顶点
-        if divergence == "bearish" and profit_pct > 0.15:
+        if divergence == "bearish" and profit_pct > 0.15 and not sell_blocked:
             signal["action"] = "SELL_DIVERGENCE"
             signal["reason"] = f"顶背离! 价创新高+动量衰减 盈利{profit_pct:.2f}%"
         
         # 🎯 止盈：时段自适应阈值 + 3分钟动量转负
-        elif profit_pct >= sess["profit_target"] and m3 < -0.1:
+        elif profit_pct >= sess["profit_target"] and m3 < -0.1 and not sell_blocked:
             signal["action"] = "SELL_PROFIT"
             signal["reason"] = f"止盈 +{profit_pct:.2f}% [{sess['name']}阈值{sess['profit_target']:.2f}%] 3m动量{m3:+.1f}"
         
         # 🏔️ 高位衰竭：日内高位 75%+ 且 5分钟动量急转
-        elif sr and sr["position"] > 75 and m5 < -0.6:
+        elif sr and sr["position"] > 75 and m5 < -0.6 and not sell_blocked:
             signal["action"] = "SELL_PEAK"
             signal["reason"] = f"高位衰竭 {sr['position']:.0f}% 5m动量{m5:+.1f}"
         
@@ -453,14 +470,18 @@ def generate_signal(market, london, history, asset):
                 signal["reason"] = f"止损 {profit_pct:.2f}% σ{volatility:.1f} [{sess['name']}]"
         
         # 🚀 假突破回踩
-        elif sr and float(sr["high"]) > 0 and buy_price < float(sr["high"]) - 0.8 and m5 < -0.3 and profit_pct > 0:
+        elif sr and float(sr["high"]) > 0 and buy_price < float(sr["high"]) - 0.8 and m5 < -0.3 and profit_pct > 0 and not sell_blocked:
             signal["action"] = "SELL_PEAK"
             signal["reason"] = f"假突破 高{sr['high']} 现{buy_price:.1f}"
+        
+        elif sell_blocked:
+            signal["note"] = f"⛔ 卖出冷却中 ({int(SAME_DIR_COOLDOWN - (time.time() - _last_trade_time))}s)"
     
     # ============================================
     # 🔥 v3 买入信号
     # ============================================
     if available > 1500:
+        buy_blocked = same_dir_blocked and _last_trade_dir == "BUY"
         # 💡 底背离：价格创新低但动量回升 → 最佳抄底点
         if divergence == "bullish" and hold_weight == 0:
             signal["action"] = "BUY_DIVERGENCE"
@@ -475,50 +496,53 @@ def generate_signal(market, london, history, asset):
                 signal["action"] = "BUY_REBUY"
                 signal["reason"] = f"回购 卖{_last_sell_price:.1f}→买{buy_price:.1f} 折扣{gain_pct:.2f}%"
             
-            # ② 追回：趋势反转确认
-            elif m5 > sess["chase_threshold"] and m15 > -0.2 and sr and sr["position"] > 30:
+            # ② 追回：趋势反转确认 + ⛔必须低于卖出价
+            elif (m5 > sess["chase_threshold"] and m15 > -0.2 
+                  and sr and sr["position"] > 30 
+                  and (not CHASE_REQUIRE_DISCOUNT or gain_pct > 0)):
                 signal["action"] = "BUY_CHASE"
                 signal["reason"] = f"追回! 5m{m5:+.1f} 15m{m15:+.1f} [{sess['name']}]"
         
         # 📈 V型反转
-        if m15 < -1.5 and m3 > 0.6:
+        if m15 < -1.5 and m3 > 0.6 and not buy_blocked:
             signal["action"] = "BUY_V"
             signal["reason"] = f"V反! 15m{m15:+.1f}→3m{m3:+.1f}"
         
         # 🌊 支撑抄底
-        if sr and sr["position"] < 15 and score > 0.15:
+        if sr and sr["position"] < 15 and score > 0.15 and not buy_blocked:
             signal["action"] = "BUY_DIP"
             signal["reason"] = f"抄底 {sr['position']:.0f}% 动量{score:+.1f}"
         
         # 💱 伦敦套利
-        if london_gram > 0 and implied_cn > 0:
+        if london_gram > 0 and implied_cn > 0 and not buy_blocked:
             if m3 > 0.3 and buy_price < implied_cn * 0.998:
                 signal["action"] = "BUY_ARB"
                 signal["reason"] = f"伦敦套利 隐含{implied_cn:.1f} 现价{buy_price:.1f}"
         
         # 🚀 突破追涨
-        if sr and float(sr["high"]) > 0:
+        if sr and float(sr["high"]) > 0 and not buy_blocked:
             breakout = (buy_price - float(sr["high"])) / float(sr["high"]) * 100
             if breakout > 0.03 and score > 0.4:
                 signal["action"] = "BUY_BREAK"
                 signal["reason"] = f"突破 +{breakout:.2f}% 动量{score:+.1f}"
+        
+        if buy_blocked and not signal["action"].startswith("BUY"):
+            signal["note"] = f"⛔ 买入冷却中 ({int(SAME_DIR_COOLDOWN - (time.time() - _last_trade_time))}s)"
     
     # 金价接近强支撑 870
     if buy_price <= 872.5:
         signal["note"] = "⚠️ 逼近870强支撑，准备抄底"
     
     # ============================================
-    # ⚡ 高波剥头皮模式（波动率 > 0.8）
+    # ⚡ 高波剥头皮模式（波动率 > 0.8，阈值 ≥ 0.5%）
     # ============================================
     if volatility > 0.8 and not signal["action"].startswith(("SELL", "BUY", "STOP")):
-        # 持仓时：快速微利即走
-        if hold_weight > 0 and profit_pct >= 0.15 and m3 < -0.05:
+        sell_blocked = same_dir_blocked and _last_trade_dir == "SELL"
+        # 持仓时：利润 ≥ 0.5% 才剥，防小波动折腾
+        if hold_weight > 0 and profit_pct >= 0.50 and m3 < -0.1 and not sell_blocked:
             signal["action"] = "SELL_SCALP"
-            signal["reason"] = f"⚡剥头皮 +{profit_pct:.2f}% 高波{volatility:.1f} 速战速决"
-        # 空仓时：微跌即抄
-        elif hold_weight == 0 and available > 1500 and m3 > 0.2:
-            signal["action"] = "BUY_SCALP"
-            signal["reason"] = f"⚡剥头皮 高波{volatility:.1f} 动量{m3:+.1f} 快进快出"
+            signal["reason"] = f"⚡剥头皮 +{profit_pct:.2f}% 高波{volatility:.1f}"
+        # 空仓剥头皮买入已禁用（太危险）
     
     return signal
 
@@ -579,7 +603,7 @@ def run_once():
 
 def execute_trade(signal, market, asset):
     """根据信号执行交易 — 追击模式"""
-    global _last_sell_price, _last_sell_time, _trade_log
+    global _last_sell_price, _last_sell_time, _trade_log, _last_trade_time, _last_trade_dir
     
     action = signal.get("action", "HOLD")
     if action == "HOLD":
@@ -618,6 +642,8 @@ def execute_trade(signal, market, asset):
                     r = ds["result"]
                     _last_sell_price = sell_price
                     _last_sell_time = datetime.now().strftime("%H:%M:%S")
+                    _last_trade_time = time.time()
+                    _last_trade_dir = "SELL"
                     _trade_log.append({
                         "time": _last_sell_time,
                         "action": "SELL",
@@ -641,7 +667,7 @@ def execute_trade(signal, market, asset):
         
         max_amount = int(available)
         # 激进模式：全仓买入
-        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_DIVERGENCE", "BUY_SCALP", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
+        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_DIVERGENCE", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
             amount = max_amount
         else:
             amount = max_amount
@@ -653,7 +679,6 @@ def execute_trade(signal, market, asset):
             "BUY_REBUY": "🔄回购",
             "BUY_CHASE": "🏃追回",
             "BUY_DIVERGENCE": "💡底背离",
-            "BUY_SCALP": "⚡剥头皮",
             "BUY_V": "📈V反",
             "BUY_DIP": "🌊抄底",
             "BUY_ARB": "💱套利",
@@ -681,6 +706,8 @@ def execute_trade(signal, market, asset):
                         "price": r.get("cfmPrice"),
                         "balance": r.get("availableBalance"),
                     })
+                    _last_trade_time = time.time()
+                    _last_trade_dir = "BUY"
                     print(f"   ✅ 成交! {r.get('cfmVol')}g @ {r.get('cfmPrice')} | 余额:{r.get('availableBalance')}{rebuy_gain}")
                     save_state()  # 持久化
                     # 重置卖出价
