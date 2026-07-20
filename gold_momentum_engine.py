@@ -11,6 +11,7 @@ import time
 import sys
 import os
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # 配置
@@ -61,7 +62,7 @@ def call_gateway(action, extra=None):
 
 def get_london_gold():
     """获取伦敦金 XAU/USD 实时价格"""
-    cmd = ["curl", "-s", XAU_API]
+    cmd = ["curl", "-s", "--connect-timeout", "5", "--max-time", "8", XAU_API]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
         return None
@@ -69,6 +70,25 @@ def get_london_gold():
         return json.loads(result.stdout)
     except:
         return None
+
+def fetch_all():
+    """并行获取全部数据 — 4路并发，总耗时≈最慢那路"""
+    results = {"market": None, "history": None, "asset": None, "london": None}
+    tasks = {
+        "market": lambda: get_market_current(),
+        "history": lambda: get_minute_history(20),  # 减少到20根K线提速
+        "asset": lambda: get_asset(),
+        "london": lambda: get_london_gold(),
+    }
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(fn): key for key, fn in tasks.items()}
+        for fut in as_completed(futures, timeout=12):
+            key = futures[fut]
+            try:
+                results[key] = fut.result()
+            except:
+                pass
+    return results["market"], results["history"], results["asset"], results["london"]
 
 def get_market_current():
     """获取积存金当前行情"""
@@ -487,6 +507,19 @@ def generate_signal(market, london, history, asset):
     if buy_price <= 872.5:
         signal["note"] = "⚠️ 逼近870强支撑，准备抄底"
     
+    # ============================================
+    # ⚡ 高波剥头皮模式（波动率 > 0.8）
+    # ============================================
+    if volatility > 0.8 and not signal["action"].startswith(("SELL", "BUY", "STOP")):
+        # 持仓时：快速微利即走
+        if hold_weight > 0 and profit_pct >= 0.15 and m3 < -0.05:
+            signal["action"] = "SELL_SCALP"
+            signal["reason"] = f"⚡剥头皮 +{profit_pct:.2f}% 高波{volatility:.1f} 速战速决"
+        # 空仓时：微跌即抄
+        elif hold_weight == 0 and available > 1500 and m3 > 0.2:
+            signal["action"] = "BUY_SCALP"
+            signal["reason"] = f"⚡剥头皮 高波{volatility:.1f} 动量{m3:+.1f} 快进快出"
+    
     return signal
 
 # ============================================================
@@ -499,11 +532,8 @@ def run_once():
     print(f"🕐 {now} | 积存金动量交易引擎")
     print(f"{'='*60}")
     
-    # 并行获取数据
-    london = get_london_gold()
-    market = get_market_current()
-    history = get_minute_history(30)
-    asset = get_asset()
+    # ⚡ 4路并发获取数据
+    market, history, asset, london = fetch_all()
     
     if not market:
         print("❌ 无法获取行情数据")
@@ -577,7 +607,7 @@ def execute_trade(signal, market, asset):
             return
         
         amount = round(vol * sell_price, 2)
-        tag = {"SELL_PROFIT": "💰止盈", "SELL_DIVERGENCE": "🚨背离", "SELL_PEAK": "🏔️逃顶", "STOP_LOSS": "🛑止损"}.get(action, "🔻卖出")
+        tag = {"SELL_PROFIT": "💰止盈", "SELL_DIVERGENCE": "🚨背离", "SELL_SCALP": "⚡剥头皮", "SELL_PEAK": "🏔️逃顶", "STOP_LOSS": "🛑止损"}.get(action, "🔻卖出")
         print(f"   {tag} {vol}g × {sell_price} = {amount}元")
         
         resp = trade_sell(vol, amount, sell_price, sell_id)
@@ -611,7 +641,7 @@ def execute_trade(signal, market, asset):
         
         max_amount = int(available)
         # 激进模式：全仓买入
-        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_DIVERGENCE", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
+        if action in ("BUY_REBUY", "BUY_CHASE", "BUY_DIVERGENCE", "BUY_SCALP", "BUY_V", "BUY_DIP", "BUY_ARB", "BUY_BREAK"):
             amount = max_amount
         else:
             amount = max_amount
@@ -623,6 +653,7 @@ def execute_trade(signal, market, asset):
             "BUY_REBUY": "🔄回购",
             "BUY_CHASE": "🏃追回",
             "BUY_DIVERGENCE": "💡底背离",
+            "BUY_SCALP": "⚡剥头皮",
             "BUY_V": "📈V反",
             "BUY_DIP": "🌊抄底",
             "BUY_ARB": "💱套利",
@@ -666,10 +697,10 @@ if __name__ == "__main__":
     parser.add_argument("mode", nargs="?", default="monitor",
                        choices=["monitor", "auto", "daemon", "cloud"],
                        help="monitor=诊断, auto=单次交易, daemon=本地守护, cloud=GitHub Actions模式")
-    parser.add_argument("--interval", type=int, default=60,
-                       help="daemon 模式扫描间隔(秒), 默认60")
-    parser.add_argument("--cooldown", type=int, default=120,
-                       help="交易冷却时间(秒), 默认120")
+    parser.add_argument("--interval", type=int, default=20,
+                       help="daemon 模式扫描间隔(秒), 默认20")
+    parser.add_argument("--cooldown", type=int, default=30,
+                       help="交易冷却时间(秒), 默认30")
     args = parser.parse_args()
 
     if args.mode == "cloud":
@@ -717,16 +748,13 @@ if __name__ == "__main__":
             cooldown_remaining = args.cooldown - (now_ts - last_trade_time)
             in_cooldown = cooldown_remaining > 0
 
-            # 获取数据
-            market = get_market_current()
+            # ⚡ 4路并发获取数据
+            t0 = time.time()
+            market, history, asset, london = fetch_all()
             if not market:
-                print(f"[{now_str}] ⚠️ 行情获取失败，30秒后重试...")
-                time.sleep(30)
+                print(f"[{now_str}] ⚠️ 行情获取失败，15秒后重试...")
+                time.sleep(15)
                 continue
-
-            history = get_minute_history(30)
-            asset = get_asset()
-            london = get_london_gold()
 
             # 生成信号
             signal = generate_signal(market, london, history, asset)
@@ -744,7 +772,8 @@ if __name__ == "__main__":
             
             sess = signal.get("session", "?") if signal else "?"
             div = f" {signal.get('divergence','')}" if signal and signal.get("divergence") else ""
-            print(f"[{now_str}] #{loop_count} {cooldown_mark} 买{buy:.1f}{lx_str} 动量{score:+.1f}{vol_str} {pos_str}{profit_str} [{sess}]{div} → {action}")
+            ms = int((time.time() - t0) * 1000)
+            print(f"[{now_str}] #{loop_count} {cooldown_mark} 买{buy:.1f}{lx_str} 动量{score:+.1f}{vol_str} {pos_str}{profit_str} [{sess}]{div} {ms}ms → {action}")
 
             # 执行交易
             if action != "HOLD" and not in_cooldown and asset:
